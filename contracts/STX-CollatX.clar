@@ -169,3 +169,123 @@
         error ERROR-CALCULATION-OVERFLOW))
 )
 
+
+(define-public (destroy-synthetic-tokens (token-amount uint))
+    (let (
+        (position-data (unwrap! (get-position-details tx-sender) 
+                              ERROR-VAULT-NOT-FOUND))
+        (user-balance (get-user-token-balance tx-sender))
+    )
+    (asserts! (> token-amount u0) ERROR-AMOUNT-MUST-BE-POSITIVE)
+    (asserts! (>= user-balance token-amount) ERROR-TOKEN-BALANCE-TOO-LOW)
+    (asserts! (>= (get issued-synthetic-tokens position-data) token-amount) 
+              ERROR-NOT-AUTHORIZED)
+
+    (match (secure-multiply (get staked-collateral position-data) token-amount)
+        collateral-calculation
+        (let (
+            (collateral-to-release (/ collateral-calculation 
+                                    (get issued-synthetic-tokens position-data)))
+        )
+
+        (try! (as-contract (stx-transfer? collateral-to-release
+                                         (as-contract tx-sender)
+                                         tx-sender)))
+
+        (match (secure-subtract (get staked-collateral position-data) 
+                              collateral-to-release)
+            remaining-collateral
+            (match (secure-subtract (get issued-synthetic-tokens position-data) 
+                                   token-amount)
+                remaining-tokens
+                (begin
+                    (map-set collateralized-positions tx-sender
+                        {
+                            staked-collateral: remaining-collateral,
+                            issued-synthetic-tokens: remaining-tokens,
+                            position-open-price: (var-get current-market-price)
+                        })
+
+                    (match (secure-subtract user-balance token-amount)
+                        new-user-balance
+                        (begin
+                            (map-set user-token-holdings tx-sender new-user-balance)
+                            (match (secure-subtract (var-get global-token-supply) 
+                                                  token-amount)
+                                new-total-supply
+                                (begin
+                                    (var-set global-token-supply new-total-supply)
+                                    (ok true))
+                                error ERROR-CALCULATION-OVERFLOW))
+                        error ERROR-CALCULATION-OVERFLOW))
+                error ERROR-CALCULATION-OVERFLOW)
+            error ERROR-CALCULATION-OVERFLOW))
+        error ERROR-CALCULATION-OVERFLOW))
+)
+
+(define-public (send-synthetic-tokens (recipient principal) (amount uint))
+    (begin
+        ;; Validation checks
+        (asserts! (> amount u0) ERROR-AMOUNT-MUST-BE-POSITIVE)
+        (asserts! (<= amount (get-user-token-balance tx-sender)) ERROR-TOKEN-BALANCE-TOO-LOW)
+        (asserts! (not (is-eq tx-sender recipient)) ERROR-INVALID-TRANSFER-RECIPIENT)
+
+        ;; Process the transfer after validations
+        (process-token-transfer tx-sender recipient amount))
+)
+
+(define-public (add-collateral (collateral-amount uint))
+    (let (
+        (position-data (default-to 
+            {
+                staked-collateral: u0, 
+                issued-synthetic-tokens: u0, 
+                position-open-price: u0
+            }
+            (get-position-details tx-sender)))
+    )
+    (asserts! (> collateral-amount u0) ERROR-AMOUNT-MUST-BE-POSITIVE)
+    (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+
+    (match (secure-add (get staked-collateral position-data) 
+                      collateral-amount)
+        updated-collateral
+        (begin
+            (map-set collateralized-positions tx-sender
+                {
+                    staked-collateral: updated-collateral,
+                    issued-synthetic-tokens: (get issued-synthetic-tokens position-data),
+                    position-open-price: (var-get current-market-price)
+                })
+            (ok true))
+        error ERROR-CALCULATION-OVERFLOW))
+)
+
+(define-public (force-close-position (position-owner principal))
+    (let (
+        (position-data (unwrap! (get-position-details position-owner) 
+                              ERROR-VAULT-NOT-FOUND))
+        (health-ratio (unwrap! (calculate-position-health-ratio position-owner) 
+                              ERROR-NOT-AUTHORIZED))
+    )
+    (asserts! (< health-ratio COLLATERAL-LIQUIDATION-RATIO) 
+              ERROR-NOT-AUTHORIZED)
+
+    ;; Transfer liquidated collateral to caller
+    (try! (as-contract (stx-transfer? (get staked-collateral position-data)
+                                     (as-contract tx-sender)
+                                     tx-sender)))
+
+    ;; Remove the liquidated position
+    (map-delete collateralized-positions position-owner)
+
+    ;; Remove tokens from circulation
+    (map-set user-token-holdings position-owner u0)
+    (match (secure-subtract (var-get global-token-supply) 
+                          (get issued-synthetic-tokens position-data))
+        updated-supply
+        (begin
+            (var-set global-token-supply updated-supply)
+            (ok true))
+        error ERROR-CALCULATION-OVERFLOW))
+)
